@@ -32,6 +32,8 @@ from inspect_ai._util.file import filesystem
 from inspect_ai._util.platform import platform_init
 from inspect_ai.log._log import EvalLog, EvalResults, EvalSample
 from inspect_ai.log._recorders import create_recorder_for_location
+from inspect_ai.log._recorders.file import LogSampleSnapshot
+from inspect_ai.log._recorders.json import JSONRecorder
 from inspect_ai.model._model import Model, get_model
 from inspect_ai.scorer._metric import Metric, MetricSpec
 
@@ -183,7 +185,16 @@ async def score(
     )
 
     recorder = create_recorder_for_location(log_file, log_dir)
-    eval_log = await recorder.read_log(log_file, header_only=bool(stream))
+    snapshot = (
+        LogSampleSnapshot(await recorder.read_log(log_file), log_file)
+        if stream and isinstance(recorder, JSONRecorder)
+        else None
+    )
+    eval_log = (
+        snapshot.header
+        if snapshot is not None
+        else await recorder.read_log(log_file, header_only=bool(stream))
+    )
     num_samples = (
         len(eval_log.samples)
         if eval_log.samples
@@ -219,7 +230,11 @@ async def score(
 
     read_sample = None
     if stream:
-        sample_map = await recorder.read_log_sample_ids(log_file)
+        sample_map = (
+            snapshot.keys
+            if snapshot is not None
+            else await recorder.read_log_sample_ids(log_file)
+        )
         stream_batch = len(sample_map) if stream is True else stream
         semaphore = anyio.Semaphore(stream_batch)
         samples_written = 0
@@ -227,46 +242,59 @@ async def score(
         @contextlib.asynccontextmanager
         async def _read_sample(idx_sample: int) -> AsyncGenerator[EvalSample, None]:
             async with semaphore:
-                sample = await recorder.read_log_sample(
-                    log_file, *sample_map[idx_sample]
+                sample = (
+                    snapshot.read(*sample_map[idx_sample])
+                    if snapshot is not None
+                    else await recorder.read_log_sample(
+                        log_file, *sample_map[idx_sample]
+                    )
                 )
                 yield sample
                 await write_recorder.log_sample(eval_log.eval, sample)
                 nonlocal samples_written
                 samples_written += 1
-                if samples_written % stream_batch == 0:
+                # Keep the original JSON input intact if scoring fails or is
+                # cancelled; the final write publishes the complete result.
+                if snapshot is None and samples_written % stream_batch == 0:
                     await write_recorder.flush(eval_log.eval)
                 del sample
 
         read_sample = _read_sample
         await write_recorder.log_init(eval_log.eval, location=output_file)
-        await write_recorder.log_start(eval_log.eval, eval_log.plan)
 
-    eval_log = await score_async(
-        log=eval_log,
-        scorers=scorers,
-        metrics=metrics,
-        model=override_model,
-        model_roles=model_roles,
-        action=action,
-        copy=False,
-        samples=read_sample,
-    )
-
-    if stream:
-        await write_recorder.log_finish(
-            eval_log.eval,
-            eval_log.status,
-            eval_log.stats,
-            eval_log.results,
-            eval_log.reductions,
-            eval_log.error,
-            invalidated=eval_log.invalidated,
-            log_updates=eval_log.log_updates,
-            config_updates=eval_log.config_updates,
+    try:
+        if stream:
+            await write_recorder.log_start(eval_log.eval, eval_log.plan)
+        eval_log = await score_async(
+            log=eval_log,
+            scorers=scorers,
+            metrics=metrics,
+            model=override_model,
+            model_roles=model_roles,
+            action=action,
+            copy=False,
+            samples=read_sample,
         )
-    else:
-        await recorder.write_log(output_file, eval_log)
+
+        if stream:
+            await write_recorder.log_finish(
+                eval_log.eval,
+                eval_log.status,
+                eval_log.stats,
+                eval_log.results,
+                eval_log.reductions,
+                eval_log.error,
+                invalidated=eval_log.invalidated,
+                log_updates=eval_log.log_updates,
+                config_updates=eval_log.config_updates,
+            )
+        else:
+            await recorder.write_log(output_file, eval_log)
+    except BaseException:
+        if stream:
+            with anyio.CancelScope(shield=True):
+                await write_recorder.log_discard(eval_log.eval, keep_destination=True)
+        raise
 
     print_results(output_file, eval_log, coverage=pre_score_coverage)
 

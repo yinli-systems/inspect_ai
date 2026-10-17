@@ -16,6 +16,8 @@ from inspect_ai.log._file import (
 )
 from inspect_ai.log._recorders import create_recorder_for_location
 from inspect_ai.log._recorders.create import recorder_type_for_location
+from inspect_ai.log._recorders.file import LogSampleSnapshot
+from inspect_ai.log._recorders.json import JSONRecorder
 from inspect_ai.log._resolve import resolve_sample_events_data
 
 
@@ -123,15 +125,28 @@ async def _stream_convert_file(
     input_recorder = recorder_type_for_location(input_file)
     output_recorder = create_recorder_for_location(output_file, output_dir)
 
-    sample_map = await input_recorder.read_log_sample_ids(input_file)
+    snapshot = (
+        LogSampleSnapshot(await input_recorder.read_log(input_file), input_file)
+        if input_recorder is JSONRecorder
+        else None
+    )
+    sample_map = (
+        snapshot.keys
+        if snapshot is not None
+        else await input_recorder.read_log_sample_ids(input_file)
+    )
 
-    concurrent_limit = len(sample_map) if stream is True else stream
+    concurrent_limit = max(1, len(sample_map) if stream is True else stream)
     semaphore = anyio.Semaphore(concurrent_limit)
     samples_processed = 0
 
     async def _convert_sample(sample_id: str | int, epoch: int) -> None:
         async with semaphore:
-            sample = await input_recorder.read_log_sample(input_file, sample_id, epoch)
+            sample = (
+                snapshot.read(sample_id, epoch)
+                if snapshot is not None
+                else await input_recorder.read_log_sample(input_file, sample_id, epoch)
+            )
             if resolve_attachments:
                 sample = resolve_sample_attachments(sample, resolve_attachments)
             else:
@@ -147,27 +162,38 @@ async def _stream_convert_file(
             nonlocal samples_processed
             samples_processed += 1
             # Flush periodically to avoid too much buffering
-            if samples_processed % concurrent_limit == 0:
+            # JSON inputs are resident already. Publish only after success so
+            # an in-place conversion cannot replace its input with partial output.
+            if snapshot is None and samples_processed % concurrent_limit == 0:
                 await output_recorder.flush(log_header.eval)
 
-    log_header = await read_eval_log_async(
-        input_file, header_only=True, resolve_attachments=resolve_attachments
+    log_header = (
+        snapshot.header
+        if snapshot is not None
+        else await read_eval_log_async(
+            input_file, header_only=True, resolve_attachments=resolve_attachments
+        )
     )
     await output_recorder.log_init(log_header.eval, location=output_file)
-    await output_recorder.log_start(log_header.eval, log_header.plan)
+    try:
+        await output_recorder.log_start(log_header.eval, log_header.plan)
 
-    async with anyio.create_task_group() as tg:
-        for sample_id, epoch in sample_map:
-            tg.start_soon(_convert_sample, sample_id, epoch)
+        async with anyio.create_task_group() as tg:
+            for sample_id, epoch in sample_map:
+                tg.start_soon(_convert_sample, sample_id, epoch)
 
-    await output_recorder.log_finish(
-        log_header.eval,
-        log_header.status,
-        log_header.stats,
-        log_header.results,
-        log_header.reductions,
-        error=log_header.error,
-        invalidated=log_header.invalidated,
-        log_updates=log_header.log_updates,
-        config_updates=log_header.config_updates,
-    )
+        await output_recorder.log_finish(
+            log_header.eval,
+            log_header.status,
+            log_header.stats,
+            log_header.results,
+            log_header.reductions,
+            error=log_header.error,
+            invalidated=log_header.invalidated,
+            log_updates=log_header.log_updates,
+            config_updates=log_header.config_updates,
+        )
+    except BaseException:
+        with anyio.CancelScope(shield=True):
+            await output_recorder.log_discard(log_header.eval, keep_destination=True)
+        raise

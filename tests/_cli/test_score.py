@@ -465,3 +465,114 @@ async def test_score_reads_coverage_before_the_scoring_pass_replaces_it(
     (coverage,) = captured
     assert coverage is not None
     assert (coverage.total_samples, coverage.completed_samples) == (10, 4)
+
+
+@pytest.mark.parametrize("stream", [1, 2, True])
+async def test_json_score_snapshot_reads_once(
+    tmp_path: pathlib.Path, stream: int | bool
+) -> None:
+    from unittest.mock import patch
+
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples and log.results
+    log.samples = [
+        log.samples[0].model_copy(update={"id": i, "epoch": 1}, deep=True)
+        for i in range(1, 4)
+    ]
+    log.results.total_samples = 3
+    log.eval.dataset.sample_ids = [1, 2, 3]
+    path = tmp_path / "case.json"
+    await write_eval_log_async(log, path)
+    with patch.object(JSONRecorder, "read_log", wraps=JSONRecorder.read_log) as read:
+        await score(
+            log_dir=str(tmp_path),
+            log_file=str(path),
+            scorer="match",
+            s=(),
+            metric=None,
+            overwrite=True,
+            action="overwrite",
+            log_level=None,
+            model="mockllm/model",
+            stream=stream,
+        )
+        assert read.call_count == 1
+    result = await read_eval_log_async(path)
+    assert [sample.id for sample in result.samples or []] == [1, 2, 3]
+    assert all(
+        sample.scores and "match" in sample.scores for sample in result.samples or []
+    )
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_json_score_failure_preserves_input(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    import anyio
+
+    from inspect_ai.log._recorders.json import JSONRecorder
+    from inspect_ai.scorer import Score, Scorer, Target, accuracy, scorer
+    from inspect_ai.solver import TaskState
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples and log.results
+    log.samples = [
+        log.samples[0].model_copy(update={"id": i, "epoch": 1}, deep=True)
+        for i in range(1, 4)
+    ]
+    log.results.total_samples = 3
+    path = tmp_path / "case.json"
+    await write_eval_log_async(log, path)
+    before = path.read_bytes()
+    entered = anyio.Event()
+
+    @scorer(metrics=[accuracy()])
+    def fail_later() -> Scorer:
+        async def run(state: TaskState, target: Target) -> Score:
+            if state.sample_id == 2:
+                entered.set()
+                if cancel:
+                    await anyio.sleep_forever()
+                raise RuntimeError("injected scorer failure")
+            return Score(value="C")
+
+        return run
+
+    monkeypatch.setattr(score_cli, "resolve_scorers", lambda *args: [fail_later()])
+    discarded: list[JSONRecorder] = []
+    original_discard = JSONRecorder.log_discard
+
+    async def discard(
+        self: JSONRecorder, spec: EvalSpec, *, keep_destination: bool = False
+    ) -> None:
+        await original_discard(self, spec, keep_destination=keep_destination)
+        discarded.append(self)
+
+    monkeypatch.setattr(JSONRecorder, "log_discard", discard)
+
+    async def run() -> None:
+        await score(
+            log_dir=str(tmp_path),
+            log_file=str(path),
+            scorer="match",
+            s=(),
+            metric=None,
+            overwrite=True,
+            action="overwrite",
+            log_level=None,
+            model="mockllm/model",
+            stream=1,
+        )
+
+    if cancel:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run)
+            await entered.wait()
+            tg.cancel_scope.cancel()
+    else:
+        with pytest.raises(Exception):
+            await run()
+    assert path.read_bytes() == before
+    assert discarded and all(not recorder.data for recorder in discarded)

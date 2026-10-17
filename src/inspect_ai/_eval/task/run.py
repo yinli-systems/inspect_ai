@@ -114,6 +114,8 @@ from inspect_ai.log._log import (
 from inspect_ai.log._recorders.buffer.transcript_history_provider import (
     BufferTranscriptHistoryProvider,
 )
+from inspect_ai.log._recorders.file import LogSampleSnapshot
+from inspect_ai.log._recorders.json import JSONRecorder
 from inspect_ai.log._recorders.streaming import (
     eval_retry_error_from_history,
     materialize_streaming_sample,
@@ -3772,15 +3774,31 @@ def eval_log_sample_source(
 
     if eval_log_info:
         reader: AsyncZipReader | None = None
+        snapshot: LogSampleSnapshot | None = None
+        # Concurrent first lookups can interleave at read_log's await.
+        snapshot_lock = anyio.Lock()
 
         async def read_from_file(id: int | str, epoch: int) -> PriorResolution:
-            nonlocal reader
-            if not reader:
-                reader = AsyncZipReader(get_async_filesystem(), eval_log_info.name)
+            nonlocal reader, snapshot
             try:
-                sample = await read_eval_log_sample_async(
-                    eval_log_info, id, epoch, reader=reader
-                )
+                if JSONRecorder.handles_location(eval_log_info.name):
+                    async with snapshot_lock:
+                        if snapshot is None:
+                            snapshot = LogSampleSnapshot(
+                                await JSONRecorder.read_log(eval_log_info.name),
+                                eval_log_info.name,
+                            )
+                    from inspect_ai.log._file import _resolve_sample_for_read
+
+                    sample = _resolve_sample_for_read(snapshot.read(id, epoch), False)
+                else:
+                    if reader is None:
+                        reader = AsyncZipReader(
+                            get_async_filesystem(), eval_log_info.name
+                        )
+                    sample = await read_eval_log_sample_async(
+                        eval_log_info, id, epoch, reader=reader
+                    )
             except (IndexError, FileNotFoundError):
                 # IndexError: sample not present in the log. FileNotFoundError:
                 # the log file itself was never written (the prior attempt

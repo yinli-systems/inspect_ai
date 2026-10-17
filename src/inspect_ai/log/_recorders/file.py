@@ -63,9 +63,38 @@ async def write_local_snapshot(
         return False
 
 
-class FileRecorder(Recorder):
-    __last_read_sample_log: tuple[str, EvalLog] | None = None
+class LogSampleSnapshot:
+    """An operation's parsed input, independent of later writes to its location.
 
+    JSON inputs are already loaded in full. Index them once for bulk callers,
+    without a process-wide path cache. Each lookup returns a private copy so
+    scorers and attachment resolution cannot mutate another lookup's input.
+    """
+
+    def __init__(self, log: EvalLog, location: str) -> None:
+        self.header = log.model_copy(update={"samples": None})
+        self.location = location
+        self._samples: dict[tuple[str, int], EvalSample] = {}
+        for sample in log.samples or []:
+            self._samples.setdefault((str(sample.id), sample.epoch), sample)
+        self.keys = sorted(
+            [(sample.id, sample.epoch) for sample in log.samples or []],
+            key=lambda key: (
+                key[1],
+                key[0] if isinstance(key[0], str) else str(key[0]).zfill(20),
+            ),
+        )
+
+    def read(self, id: str | int, epoch: int) -> EvalSample:
+        sample = self._samples.get((str(id), epoch))
+        if sample is None:
+            raise IndexError(
+                f"Sample id {id} for epoch {epoch} not found in log {self.location}"
+            )
+        return sample.model_copy(deep=True)
+
+
+class FileRecorder(Recorder):
     def __init__(
         self, log_dir: str, suffix: str, fs_options: dict[str, Any] | None = None
     ) -> None:
@@ -98,7 +127,7 @@ class FileRecorder(Recorder):
         if id is None and uuid is None:
             raise ValueError("You must specify an 'id' or 'uuid' to read")
 
-        # establish the log to read from (might be cached)
+        # read the current document for this operation
         eval_log = await cls._log_file_maybe_cached(location)
 
         # throw if no samples
@@ -136,7 +165,7 @@ class FileRecorder(Recorder):
     @classmethod
     @override
     async def read_log_sample_summaries(cls, location: str) -> list[EvalSampleSummary]:
-        # establish the log to read from (might be cached)
+        # read the current document for this operation
         eval_log = await cls._log_file_maybe_cached(location)
         if not eval_log.samples:
             return []
@@ -144,13 +173,10 @@ class FileRecorder(Recorder):
 
     @classmethod
     async def _log_file_maybe_cached(cls, location: str) -> EvalLog:
-        # establish the log to read from (might be cached)
-        if cls.__last_read_sample_log and (cls.__last_read_sample_log[0] == location):
-            eval_log = cls.__last_read_sample_log[1]
-        else:
-            eval_log = await cls.read_log(location)
-            cls.__last_read_sample_log = (location, eval_log)
-        return eval_log
+        # Retain this private entrypoint for subclasses/tests, but never share
+        # an unversioned parsed document across independent read operations.
+        # Same path does not imply same version; bulk APIs own their parse.
+        return await cls.read_log(location)
 
     def _log_file_key(self, eval: EvalSpec) -> str:
         return eval_log_name(

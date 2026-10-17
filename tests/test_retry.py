@@ -804,3 +804,106 @@ def test_eval_retry_keeps_untrusted_content_and_task_viewer() -> None:
     assert log2.eval.viewer is not None
     assert log2.eval.viewer.trust_content is False
     assert log2.eval.viewer.task_samples_view == TaskSamplesView(name="Custom")
+
+
+async def test_json_retry_source_snapshot(tmp_path: Path) -> None:
+    from functools import partial
+    from unittest.mock import patch
+
+    from inspect_ai._eval.task.run import eval_log_sample_source
+    from inspect_ai._util._async import tg_collect
+    from inspect_ai._util.asyncfiles import AsyncFilesystem
+    from inspect_ai._util.file import filesystem
+    from inspect_ai.dataset import MemoryDataset, Sample
+    from inspect_ai.log import EvalSample, read_eval_log_async, write_eval_log_async
+    from inspect_ai.log._file import log_file_info_async
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples
+    log.samples = [
+        log.samples[0].model_copy(
+            update={"id": i, "epoch": 1, "input": "old"}, deep=True
+        )
+        for i in range(1, 4)
+    ]
+    log.eval.dataset.samples = 3
+    path = tmp_path / "case.json"
+    await write_eval_log_async(log, path)
+    info = await log_file_info_async(filesystem(str(path)).info(str(path)))
+    dataset = MemoryDataset([Sample(id=i, input="q") for i in range(1, 4)])
+    source = eval_log_sample_source(log, info, dataset)
+    async with AsyncFilesystem():
+        with patch.object(
+            JSONRecorder, "read_log", wraps=JSONRecorder.read_log
+        ) as read:
+            rows = await tg_collect([partial(source.lookup, i, 1) for i in range(1, 4)])
+            assert read.call_count == 1
+            assert all(
+                isinstance(row, EvalSample) and row.input == "old" for row in rows
+            )
+            assert isinstance(rows[0], EvalSample)
+            rows[0].input = "caller mutation"
+            for sample in log.samples:
+                sample.input = "new"
+            await write_eval_log_async(log, path)
+            again = await source.lookup(1, 1)
+            assert isinstance(again, EvalSample) and again.input == "old"
+            assert read.call_count == 1
+            next_source = eval_log_sample_source(log, info, dataset)
+            fresh = await next_source.lookup(1, 1)
+            assert isinstance(fresh, EvalSample) and fresh.input == "new"
+            assert read.call_count == 2
+
+
+async def test_json_retry_cancelled_load_can_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+
+    from inspect_ai._eval.task.run import eval_log_sample_source
+    from inspect_ai._util.file import filesystem
+    from inspect_ai.dataset import MemoryDataset, Sample
+    from inspect_ai.log import (
+        EvalLog,
+        EvalSample,
+        read_eval_log_async,
+        write_eval_log_async,
+    )
+    from inspect_ai.log._file import log_file_info_async
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples
+    log.samples = [log.samples[0].model_copy(update={"id": 1, "epoch": 1})]
+    log.eval.dataset.samples = 1
+    path = tmp_path / "case.json"
+    await write_eval_log_async(log, path)
+    info = await log_file_info_async(filesystem(str(path)).info(str(path)))
+    source = eval_log_sample_source(log, info, MemoryDataset([Sample(id=1, input="q")]))
+    original_read = JSONRecorder.read_log
+    entered = anyio.Event()
+    attempts = 0
+
+    async def read(
+        location: str, header_only: bool = False, exclude_fields: set[str] | None = None
+    ) -> EvalLog:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            entered.set()
+            await anyio.sleep_forever()
+        return await original_read(location, header_only, exclude_fields)
+
+    monkeypatch.setattr(JSONRecorder, "read_log", read)
+
+    async def lookup() -> None:
+        await source.lookup(1, 1)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(lookup)
+        await entered.wait()
+        tg.cancel_scope.cancel()
+    recovered = await source.lookup(1, 1)
+    assert isinstance(recovered, EvalSample)
+    assert recovered.id == 1 and attempts == 2

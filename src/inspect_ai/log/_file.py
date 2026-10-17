@@ -954,6 +954,32 @@ async def read_eval_log_samples_by_id_async(
 
     # materialise the requested samples so we can preserve order and reuse them
     requested = list(samples)
+    if not requested:
+        return []
+
+    from ._recorders.json import JSONRecorder
+
+    recorder = (
+        recorder_type_for_location(log_file)
+        if format == "auto"
+        else recorder_type_for_format(format)
+    )
+    if recorder is JSONRecorder:
+        log = await JSONRecorder.read_log(log_file)
+        by_key: dict[tuple[str, int], EvalSample] = {}
+        for sample in log.samples or []:
+            by_key.setdefault((str(sample.id), sample.epoch), sample)
+        output: list[EvalSample] = []
+        for sample_id, epoch in requested:
+            key = (str(sample_id), epoch)
+            if key not in by_key:
+                raise IndexError(f"Sample {key} not found in log {log_file}")
+            output.append(
+                _resolve_sample_for_read(
+                    by_key[key].model_copy(deep=True), resolve_attachments
+                )
+            )
+        return output
 
     # share a single reader across all reads (its central directory is cached
     # and guarded by a lock, and member reads use independent range requests)
@@ -1043,7 +1069,8 @@ def read_eval_log_samples(
     """Read all samples from an evaluation log incrementally.
 
     Generator for samples in a log file. Only one sample at a time
-    will be read into memory and yielded to the caller.
+    will be read into memory and yielded to the caller for .eval logs.
+    JSON logs are parsed in full once per iterator.
 
     Args:
        log_file (str | FileInfo): Log file to read.
@@ -1065,8 +1092,34 @@ def read_eval_log_samples(
        IndexError: If `all_samples_required` is `True` and one of the target
           samples does not exist in the log file.
     """
-    # read header
-    log_header = read_eval_log(log_file, header_only=True, format=format)
+    if current_async_backend() == "trio":
+        raise RuntimeError(
+            "read_eval_log_samples cannot be called from a trio async context"
+        )
+
+    from ._recorders.json import JSONRecorder
+
+    location = (
+        log_file
+        if isinstance(log_file, str)
+        else log_file.as_posix()
+        if isinstance(log_file, Path)
+        else log_file.name
+    )
+    recorder = (
+        recorder_type_for_location(location)
+        if format == "auto"
+        else recorder_type_for_format(format)
+    )
+    json_samples: dict[tuple[str, int], EvalSample] | None = None
+    if recorder is JSONRecorder:
+        log = run_coroutine(JSONRecorder.read_log(location))
+        json_samples = {}
+        for sample in log.samples or []:
+            json_samples.setdefault((str(sample.id), sample.epoch), sample)
+        log_header = log
+    else:
+        log_header = read_eval_log(log_file, header_only=True, format=format)
 
     # do we have the list of samples?
     if log_header.eval.dataset.sample_ids is None:
@@ -1088,14 +1141,22 @@ def read_eval_log_samples(
     for sample_id in log_header.eval.dataset.sample_ids:
         for epoch_id in range(1, (log_header.eval.config.epochs or 1) + 1):
             try:
-                sample = read_eval_log_sample(
-                    log_file=log_file,
-                    id=sample_id,
-                    epoch=epoch_id,
-                    resolve_attachments=resolve_attachments,
-                    format=format,
-                    exclude_fields=exclude_fields,
-                )
+                if json_samples is not None:
+                    key = (str(sample_id), epoch_id)
+                    if key not in json_samples:
+                        raise IndexError(f"Sample {key} not found in log {location}")
+                    sample = _resolve_sample_for_read(
+                        json_samples[key], resolve_attachments
+                    )
+                else:
+                    sample = read_eval_log_sample(
+                        log_file=log_file,
+                        id=sample_id,
+                        epoch=epoch_id,
+                        resolve_attachments=resolve_attachments,
+                        format=format,
+                        exclude_fields=exclude_fields,
+                    )
                 yield sample
             except IndexError:
                 if all_samples_required:

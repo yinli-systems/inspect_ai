@@ -126,7 +126,7 @@ inspect log convert logs_old \
    --stream 10
 ```
 
-Note that using the `--stream` option limits the total number of samples held in memory at once during the conversion, which can be consequential for larger log files.
+For `.eval` inputs, `--stream` limits the number of sample payloads read concurrently. JSON inputs are parsed in full once per conversion. Converting or re-scoring a JSON input with streaming enabled publishes output only after all samples succeed; a failure or cancellation before final publication leaves an existing destination intact. Final-write atomicity depends on the storage backend.
     
 ::: {.callout-important}
 If you are using [Inspect Scout](https://meridianlabs-ai.github.io/inspect_scout/) for transcript analysis, you will want to make sure to use an up to date version (v0.4.22 or later) that supports reading the condensed log format.
@@ -324,7 +324,7 @@ If you are working with log files that are too large to comfortably fit in memor
     log = read_eval_log(log_file, header_only = True)
     ```
 
-3.  If you want to read individual samples, either read them selectively using `read_eval_log_sample()`, or read them iteratively using `read_eval_log_samples()` (which will ensure that only one sample at a time is read into memory):
+3.  If you want to read individual samples, either read them selectively using `read_eval_log_sample()`, or read them iteratively using `read_eval_log_samples()` (which reads one sample payload at a time for `.eval` logs; JSON logs are parsed in full once per iterator):
 
     ``` python
     # read a single sample
@@ -334,6 +334,8 @@ If you are working with log files that are too large to comfortably fit in memor
     for sample in read_eval_log_samples(log_file):
         ...
     ```
+
+Independent JSON sample and summary reads see the current file. A batch read or iterator retains its own parsed input for its lifetime, so changing the file does not retarget that operation. For multiple samples, use a batch read or iterator to avoid parsing JSON separately for each sample.
 
 Note that `read_eval_log_samples()` will raise an error if you pass it a log that does not have `status=="success"` (this is because it can't read all of the samples in an incomplete log). If you want to read the samples anyway, pass the `all_samples_required=False` option:
 

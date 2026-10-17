@@ -720,3 +720,91 @@ def test_convert_chunked_cli_hidden():
     command = log_command.get_command(None, "convert-chunked")
     assert command is not None
     assert command.hidden
+
+
+@pytest.mark.parametrize("stream", [1, 2, True])
+@pytest.mark.parametrize("same_path", [False, True])
+async def test_json_stream_conversion_owns_input(
+    tmp_path: pathlib.Path, stream: int | Literal[True], same_path: bool
+) -> None:
+    from unittest.mock import patch
+
+    from inspect_ai.log import read_eval_log_async, write_eval_log_async
+    from inspect_ai.log._convert import _stream_convert_file
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    log = await read_eval_log_async(
+        str(_TESTS_DIR / "test_eval_log/log_streaming.eval")
+    )
+    assert log.samples
+    log.samples = [
+        log.samples[0].model_copy(update={"id": i, "epoch": 1}, deep=True)
+        for i in range(1, 4)
+    ]
+    path = tmp_path / "case.json"
+    await write_eval_log_async(log, path)
+    output = path if same_path else tmp_path / "converted.eval"
+    with patch.object(JSONRecorder, "read_log", wraps=JSONRecorder.read_log) as read:
+        await _stream_convert_file(str(path), str(output), str(tmp_path), False, stream)
+        assert read.call_count == 1
+    converted = await read_eval_log_async(output)
+    assert [s.id for s in converted.samples or []] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_json_conversion_failure_preserves_input(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    import anyio
+
+    from inspect_ai.log import read_eval_log_async, write_eval_log_async
+    from inspect_ai.log._convert import _stream_convert_file
+    from inspect_ai.log._log import EvalSpec
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    log = await read_eval_log_async(
+        str(_TESTS_DIR / "test_eval_log/log_streaming.eval")
+    )
+    assert log.samples
+    log.samples = [
+        log.samples[0].model_copy(update={"id": i, "epoch": 1}, deep=True)
+        for i in range(1, 4)
+    ]
+    path = tmp_path / "case.json"
+    await write_eval_log_async(log, path)
+    before = path.read_bytes()
+    entered = anyio.Event()
+    original = JSONRecorder.log_sample
+    recorders: list[JSONRecorder] = []
+
+    async def intercept(
+        self: JSONRecorder,
+        spec: EvalSpec,
+        sample: EvalSample,
+        *,
+        write_through: bool = False,
+    ) -> None:
+        if self not in recorders:
+            recorders.append(self)
+        if sample.id == 2:
+            entered.set()
+            if cancel:
+                await anyio.sleep_forever()
+            raise RuntimeError("injected conversion failure")
+        await original(self, spec, sample, write_through=write_through)
+
+    monkeypatch.setattr(JSONRecorder, "log_sample", intercept)
+
+    async def convert() -> None:
+        await _stream_convert_file(str(path), str(path), str(tmp_path), False, 1)
+
+    if cancel:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(convert)
+            await entered.wait()
+            tg.cancel_scope.cancel()
+    else:
+        with pytest.raises(ExceptionGroup):
+            await convert()
+    assert path.read_bytes() == before
+    assert recorders and all(not recorder.data for recorder in recorders)

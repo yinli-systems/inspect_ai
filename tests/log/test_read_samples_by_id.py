@@ -1,5 +1,6 @@
 import tempfile
 from collections.abc import Iterator
+from pathlib import Path
 
 import anyio
 import pytest
@@ -128,3 +129,138 @@ def test_read_samples_by_id_async_runs_under_anyio(log_file: str):
         assert [(s.id, s.epoch) for s in samples] == requested
 
     anyio.run(main)
+
+
+@pytest.mark.parametrize("operation", ["single", "summaries", "batch", "stream"])
+async def test_json_reads_observe_replacement(tmp_path: Path, operation: str) -> None:
+    from inspect_ai.log import (
+        read_eval_log_async,
+        read_eval_log_sample_async,
+        read_eval_log_sample_summaries_async,
+        read_eval_log_samples,
+    )
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples
+    log.samples = [log.samples[0]]
+    log.samples[0].id = "one"
+    log.samples[0].input = "old"
+    log.eval.dataset.sample_ids = ["one"]
+    log.eval.config.epochs = 1
+    path = tmp_path / "case.json"
+    path.write_text(log.model_dump_json())
+
+    async def inputs() -> list[str]:
+        if operation == "single":
+            rows = [await read_eval_log_sample_async(path, "one")]
+        elif operation == "summaries":
+            return [
+                str(s.input) for s in await read_eval_log_sample_summaries_async(path)
+            ]
+        elif operation == "batch":
+            rows = await read_eval_log_samples_by_id_async(path, [("one", 1)])
+        else:
+            rows = await anyio.to_thread.run_sync(
+                lambda: list(read_eval_log_samples(path))
+            )
+        return [str(s.input) for s in rows]
+
+    assert await inputs() == ["old"]
+    log.samples[0].input = "new"
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(log.model_dump_json())
+    replacement.replace(path)
+    assert await inputs() == ["new"]
+    assert (await JSONRecorder.read_log(str(path))).samples
+
+
+async def test_json_batch_parse_owned_by_operation(tmp_path: Path) -> None:
+    from unittest.mock import patch
+
+    from inspect_ai.log import read_eval_log_async
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples
+    first = log.samples[0].model_copy(update={"id": "one", "epoch": 1})
+    second = first.model_copy(update={"id": "two", "input": "second"})
+    log.samples = [first, second]
+    path = tmp_path / "case.json"
+    path.write_text(log.model_dump_json())
+    with patch.object(JSONRecorder, "read_log", wraps=JSONRecorder.read_log) as read:
+        rows = await read_eval_log_samples_by_id_async(
+            path, [("two", 1), ("one", 1), ("two", 1)]
+        )
+        assert [s.id for s in rows] == ["two", "one", "two"]
+        assert read.call_count == 1
+
+
+async def test_json_empty_batch_does_not_read(tmp_path: Path) -> None:
+    assert await read_eval_log_samples_by_id_async(tmp_path / "missing.json", []) == []
+
+
+async def test_json_batch_duplicate_results_are_independent(tmp_path: Path) -> None:
+    from inspect_ai.log import read_eval_log_async, write_eval_log_async
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples
+    log.samples = [log.samples[0]]
+    path = tmp_path / "case.json"
+    await write_eval_log_async(log, path)
+    key = (log.samples[0].id, log.samples[0].epoch)
+    rows = await read_eval_log_samples_by_id_async(path, [key, key])
+    rows[0].metadata["caller_mutation"] = True
+    assert "caller_mutation" not in rows[1].metadata
+    assert (
+        "caller_mutation"
+        not in (await read_eval_log_samples_by_id_async(path, [key]))[0].metadata
+    )
+
+
+def test_json_iterator_retains_missing_sample_ids_error(tmp_path: Path) -> None:
+    from inspect_ai.log import read_eval_log, read_eval_log_samples
+
+    log = read_eval_log("tests/log/test_eval_log/log_streaming.eval")
+    log.eval.dataset.sample_ids = None
+    path = tmp_path / "legacy.json"
+    path.write_text(log.model_dump_json(exclude_none=True))
+    with pytest.raises(RuntimeError, match="does not include sample_ids"):
+        list(read_eval_log_samples(path))
+
+
+async def test_json_s3_independent_reads_and_batch_snapshot(
+    tmp_path: Path, mock_s3: None
+) -> None:
+    from unittest.mock import patch
+
+    import boto3
+
+    from inspect_ai.log import read_eval_log_async, read_eval_log_sample_async
+    from inspect_ai.log._recorders.json import JSONRecorder
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples
+    log.samples = [
+        log.samples[0].model_copy(update={"id": "one", "epoch": 1, "input": "old"})
+    ]
+    client = boto3.client("s3")
+    key = f"freshness/{tmp_path.name}.json"
+    location = f"s3://test-bucket/{key}"
+    client.put_object(
+        Bucket="test-bucket",
+        Key=key,
+        Body=log.model_dump_json(exclude_none=True).encode(),
+    )
+    assert (await read_eval_log_sample_async(location, "one")).input == "old"
+    log.samples[0].input = "new"
+    client.put_object(
+        Bucket="test-bucket",
+        Key=key,
+        Body=log.model_dump_json(exclude_none=True).encode(),
+    )
+    assert (await read_eval_log_sample_async(location, "one")).input == "new"
+    with patch.object(JSONRecorder, "read_log", wraps=JSONRecorder.read_log) as read:
+        rows = await read_eval_log_samples_by_id_async(location, [("one", 1)] * 3)
+        assert [row.input for row in rows] == ["new"] * 3
+        assert read.call_count == 1
