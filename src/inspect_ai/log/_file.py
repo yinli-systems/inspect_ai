@@ -1042,8 +1042,10 @@ def read_eval_log_samples(
 ) -> Generator[EvalSample, None, None]:
     """Read all samples from an evaluation log incrementally.
 
-    Generator for samples in a log file. Only one sample at a time
-    will be read into memory and yielded to the caller.
+    Reads one sample payload at a time for .eval logs; the archive index
+    remains in memory. JSON logs are parsed in full. Runtime-added IDs and
+    explicit epochs are included after configured seed runs. The log file
+    must remain unchanged during iteration.
 
     Args:
        log_file (str | FileInfo): Log file to read.
@@ -1065,41 +1067,144 @@ def read_eval_log_samples(
        IndexError: If `all_samples_required` is `True` and one of the target
           samples does not exist in the log file.
     """
-    # read header
-    log_header = read_eval_log(log_file, header_only=True, format=format)
+    # Preserve the sync API's existing restriction on a running Trio task.
+    if current_async_backend() == "trio":
+        raise RuntimeError(
+            "read_eval_log_samples cannot be called from a trio async context"
+        )
 
-    # do we have the list of samples?
-    if log_header.eval.dataset.sample_ids is None:
+    from ._recorders.json import JSONRecorder
+
+    location = (
+        log_file
+        if isinstance(log_file, str)
+        else log_file.as_posix()
+        if isinstance(log_file, Path)
+        else log_file.name
+    )
+    recorder = (
+        recorder_type_for_location(location)
+        if format == "auto"
+        else recorder_type_for_format(format)
+    )
+    if recorder is JSONRecorder:
+        # One parse belongs to this operation, not a process-global path cache.
+        log = run_coroutine(JSONRecorder.read_log(location))
+        by_key: dict[tuple[str, int], EvalSample] = {}
+        for sample in log.samples or []:
+            by_key.setdefault((str(sample.id), sample.epoch), sample)
+        for key in _ordered_log_sample_keys(log, by_key, all_samples_required):
+            if key not in by_key:
+                if all_samples_required:
+                    raise IndexError(f"Sample {key} not found in log {location}")
+                continue
+            yield _resolve_sample_for_read(by_key[key], resolve_attachments)
+        return
+
+    # Retain remote async-backed I/O; snapshot pinning is not introduced here.
+    log_header = read_eval_log(location, header_only=True, format=format)
+    keys = run_coroutine(_read_archive_sample_keys(location))
+    for sample_id, epoch in _ordered_log_sample_keys(
+        log_header, keys, all_samples_required
+    ):
+        try:
+            sample = read_eval_log_sample(
+                location,
+                sample_id,
+                epoch,
+                resolve_attachments=resolve_attachments,
+                format=format,
+                exclude_fields=exclude_fields,
+            )
+        except IndexError:
+            if all_samples_required:
+                raise
+            continue
+        if (str(sample.id), sample.epoch) != (sample_id, epoch):
+            raise ValueError(
+                f"Sample identity does not match member for {(sample_id, epoch)}"
+            )
+        yield sample
+
+
+def _ordered_log_sample_keys(
+    header: EvalLog,
+    observed: Iterable[tuple[str, int]],
+    all_samples_required: bool,
+) -> Generator[tuple[str, int], None, None]:
+    """Seed order first, then additional persisted runs, once per identity.
+
+    Dataset identity is intentionally seed-sized for SampleSource retry reuse.
+    It is not an index of all records. Retain strict missing-seed checks while
+    admitting runtime-added IDs and explicit epochs above the configured count.
+    """
+    if header.eval.dataset.sample_ids is None:
         raise RuntimeError(
             "This log file does not include sample_ids "
-            + "(fully reading and re-writing the log will add sample_ids)"
+            "(fully reading and re-writing the log will add sample_ids)"
         )
-
-    # if the status is not success and all_samples_required, this is an error
-    if all_samples_required and (
-        log_header.status != "success" or log_header.invalidated
-    ):
+    if all_samples_required and (header.status != "success" or header.invalidated):
         raise RuntimeError(
-            f"This log does not have all samples (status={log_header.status}). "
-            + "Specify all_samples_required=False to read the samples that exist."
+            f"This log does not have all samples (status={header.status}). "
+            "Specify all_samples_required=False to read the samples that exist."
         )
+    observed_keys = list(dict.fromkeys(observed))
+    configured_epochs = header.eval.config.epochs or 1
+    epochs_by_id: dict[str, list[int]] = {}
+    if not all_samples_required:
+        # A cancelled run may have a huge epoch plan but few records. Do not
+        # enumerate absent work or retain one "seen" entry per planned run.
+        for sample_id, epoch in observed_keys:
+            if 1 <= epoch <= configured_epochs:
+                epochs_by_id.setdefault(sample_id, []).append(epoch)
 
-    # loop over samples and epochs
-    for sample_id in log_header.eval.dataset.sample_ids:
-        for epoch_id in range(1, (log_header.eval.config.epochs or 1) + 1):
-            try:
-                sample = read_eval_log_sample(
-                    log_file=log_file,
-                    id=sample_id,
-                    epoch=epoch_id,
-                    resolve_attachments=resolve_attachments,
-                    format=format,
-                    exclude_fields=exclude_fields,
-                )
-                yield sample
-            except IndexError:
-                if all_samples_required:
-                    raise
+    seen: set[tuple[str, int]] = set()
+    for sample_id in dict.fromkeys(str(id) for id in header.eval.dataset.sample_ids):
+        epochs: Iterable[int] = (
+            range(1, configured_epochs + 1)
+            if all_samples_required
+            else sorted(epochs_by_id.get(sample_id, []))
+        )
+        for epoch in epochs:
+            key = (sample_id, epoch)
+            # Strict readers raise on the first missing key, so their live
+            # key set is bounded by persisted records plus that missing key.
+            seen.add(key)
+            yield key
+    for key in observed_keys:
+        if key not in seen:
+            seen.add(key)
+            yield key
+
+
+def _archive_sample_key(name: str) -> tuple[str, int] | None:
+    if not (name.startswith("samples/") and name.endswith(".json")):
+        return None
+    sample_id, separator, epoch = name[len("samples/") : -len(".json")].rpartition(
+        "_epoch_"
+    )
+    if not separator or not epoch:
+        raise ValueError(f"Invalid sample member name: {name}")
+    try:
+        epoch_number = int(epoch)
+    except ValueError:
+        raise ValueError(f"Invalid sample member name: {name}") from None
+    if str(epoch_number) != epoch:
+        raise ValueError(f"Non-canonical sample epoch in member: {name}")
+    return sample_id, epoch_number
+
+
+async def _read_archive_sample_keys(location: str) -> list[tuple[str, int]]:
+    async with AsyncFilesystem() as fs:
+        reader = AsyncZipReader(fs, location)
+        directory = await reader.entries()
+        return list(
+            dict.fromkeys(
+                key
+                for entry in directory.entries
+                if (key := _archive_sample_key(entry.filename)) is not None
+            )
+        )
 
 
 def manifest_eval_log_name(info: EvalLogInfo, log_dir: str, sep: str) -> str:

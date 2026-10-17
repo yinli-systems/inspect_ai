@@ -2704,3 +2704,64 @@ def test_log_without_description_reads(log_file: str) -> None:
     assert log.samples
     assert all(sample.description is None for sample in log.samples)
     assert all(sample.summary().description is None for sample in log.samples)
+
+
+@pytest.mark.parametrize("log_format", ["eval", "json"])
+@pytest.mark.parametrize("empty_seed", [False, True])
+def test_stream_sample_source_records(
+    tmp_path: Path, log_format: Literal["eval", "json"], empty_seed: bool
+) -> None:
+    from inspect_ai import SampleSource
+
+    class Source(SampleSource):
+        def __init__(self) -> None:
+            self.sent = False
+
+        def initial_samples(self) -> list[Sample]:
+            return [] if empty_seed else [Sample(id="seed", input="seed")]
+
+        async def next_samples(self) -> list[Sample] | None:
+            if self.sent:
+                return None
+            self.sent = True
+            return [Sample(id="extra1", input="one"), Sample(id="extra2", input="two")]
+
+    log = eval(
+        Task(dataset=Source()),
+        model="mockllm/model",
+        log_format=log_format,
+        log_dir=str(tmp_path),
+        display="none",
+    )[0]
+    full = read_eval_log(log.location)
+    expected = ["extra1", "extra2"] if empty_seed else ["seed", "extra1", "extra2"]
+    assert full.status == "success"
+    assert full.eval.dataset.sample_ids == ([] if empty_seed else ["seed"])
+    assert full.samples and {s.id for s in full.samples} == set(expected)
+    assert [s.id for s in read_eval_log_samples(log.location)] == expected
+
+
+@pytest.mark.parametrize("log_format", ["eval", "json"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_stream_persisted_epochs_and_missing_seed(
+    tmp_path: Path, log_format: Literal["eval", "json"], strict: bool
+) -> None:
+    log = read_eval_log("tests/log/test_eval_log/log_streaming.eval")
+    assert log.samples
+    sample = log.samples[0].model_copy(deep=True)
+    sample.id = "extra_epoch_2"
+    sample.epoch = 9
+    seed = sample.model_copy(update={"id": "seed", "epoch": 1})
+    log.samples = [sample, seed]
+    log.eval.dataset.sample_ids = ["seed", "missing"]
+    log.eval.config.epochs = 1
+    path = tmp_path / f"epochs.{log_format}"
+    write_eval_log(log, path)
+    if strict:
+        with pytest.raises(IndexError):
+            list(read_eval_log_samples(path))
+    else:
+        assert [(s.id, s.epoch) for s in read_eval_log_samples(path, False)] == [
+            ("seed", 1),
+            ("extra_epoch_2", 9),
+        ]
