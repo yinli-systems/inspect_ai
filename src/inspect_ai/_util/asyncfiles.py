@@ -1719,7 +1719,11 @@ def s3_read_file(s3: Any, bucket: str, key: str) -> bytes:
 
 def s3_read_file_info(s3: Any, bucket: str, key: str) -> FileContent:
     response = s3.get_object(Bucket=bucket, Key=key)
-    return _s3_file_content(cast(bytes, response["Body"].read()), response)
+    body = response["Body"]
+    try:
+        return _s3_file_content(cast(bytes, body.read()), response)
+    finally:
+        body.close()
 
 
 def _s3_file_content(data: bytes, response: dict[str, Any]) -> FileContent:

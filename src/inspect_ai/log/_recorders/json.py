@@ -488,16 +488,11 @@ async def _s3_read_with_etag(
     Returns:
         (content, etag) - etag is guaranteed to match content
     """
-    bucket, key = _s3_bucket_and_key(location)
-
     async with AsyncFilesystem() as async_fs:
-        s3_client = await async_fs.s3_client_async()
-        response = await s3_client.get_object(Bucket=bucket, Key=key)
-        content = await response["Body"].read()
-        content = content.decode("utf-8")
-        etag = response["ETag"].strip('"')  # S3 returns ETag with quotes
-
-        return content, etag
+        content = await async_fs.read_file_info(location)
+        if content.etag is None:
+            raise RuntimeError("S3 response did not include an ETag")
+        return content.data.decode("utf-8"), content.etag
 
 
 def _scan_header_keys(f: IO[bytes]) -> tuple[int | None, str]:

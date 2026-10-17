@@ -2704,3 +2704,96 @@ def test_log_without_description_reads(log_file: str) -> None:
     assert log.samples
     assert all(sample.description is None for sample in log.samples)
     assert all(sample.summary().description is None for sample in log.samples)
+
+
+async def test_json_s3_full_read_matches_content_etag(
+    tmp_path: Path, mock_s3: None
+) -> None:
+    import boto3
+
+    from inspect_ai.log import read_eval_log_async
+
+    log = await read_eval_log_async("tests/log/test_eval_log/log_streaming.eval")
+    client = boto3.client("s3")
+    key = f"json-reader/{tmp_path.name}.json"
+    location = f"s3://test-bucket/{key}"
+    for marker in ["first", "second"]:
+        log.eval.metadata = {"marker": marker}
+        result = client.put_object(
+            Bucket="test-bucket",
+            Key=key,
+            Body=log.model_dump_json(exclude_none=True).encode(),
+        )
+        actual = await read_eval_log_async(location)
+        assert actual.eval.metadata == {"marker": marker}
+        assert actual.etag == result["ETag"].strip('"')
+    client.delete_object(Bucket="test-bucket", Key=key)
+    with pytest.raises(FileNotFoundError):
+        await read_eval_log_async(location)
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+async def test_json_s3_read_closes_response(
+    outcome: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    from unittest.mock import AsyncMock, Mock
+
+    import anyio
+
+    from inspect_ai._util._async import current_async_backend
+    from inspect_ai._util.asyncfiles import AsyncFilesystem, bind_async_filesystem
+    from inspect_ai.log._recorders.json import _s3_read_with_etag
+
+    entered = threading.Event()
+    release = threading.Event()
+    body = Mock()
+
+    def read_sync() -> bytes:
+        entered.set()
+        if outcome == "error":
+            raise OSError("injected read failure")
+        if outcome == "cancel":
+            assert release.wait(timeout=10)
+        return b"{}"
+
+    async def read_async() -> bytes:
+        entered.set()
+        if outcome == "error":
+            raise OSError("injected read failure")
+        if outcome == "cancel":
+            await anyio.sleep_forever()
+        return b"{}"
+
+    fs = AsyncFilesystem()
+    response = {"Body": body, "ETag": '"version-1"'}
+    if current_async_backend() == "asyncio":
+        body.read = AsyncMock(side_effect=read_async)
+        client = Mock(get_object=AsyncMock(return_value=response))
+        monkeypatch.setattr(fs, "s3_client_async", AsyncMock(return_value=client))
+    else:
+        body.read = Mock(side_effect=read_sync)
+        client = Mock(get_object=Mock(return_value=response))
+        monkeypatch.setattr(fs, "s3_client", Mock(return_value=client))
+
+    async def read() -> None:
+        assert await _s3_read_with_etag("s3://test-bucket/log.json") == (
+            "{}",
+            "version-1",
+        )
+
+    with bind_async_filesystem(fs):
+        if outcome == "error":
+            with pytest.raises(OSError, match="injected read failure"):
+                await read()
+        elif outcome == "cancel":
+            async with anyio.create_task_group() as group:
+                group.start_soon(read)
+                try:
+                    assert await anyio.to_thread.run_sync(entered.wait, 10)
+                    group.cancel_scope.cancel()
+                finally:
+                    release.set()
+        else:
+            await read()
+    body.close.assert_called_once_with()
