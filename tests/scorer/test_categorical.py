@@ -1,11 +1,13 @@
 import enum
 import os
 import tempfile
+from pathlib import Path
 from typing import cast
 
 import pytest
 
 from inspect_ai import Epochs, Task, eval
+from inspect_ai._util.registry import registry_info
 from inspect_ai.dataset import Sample
 from inspect_ai.log import read_eval_log, recompute_metrics, write_eval_log
 from inspect_ai.scorer import (
@@ -15,6 +17,7 @@ from inspect_ai.scorer import (
     Target,
     Value,
     accuracy,
+    aggregate,
     categorical,
     frequency,
     scorer,
@@ -149,6 +152,64 @@ def test_metric_decorator_kwarg_only_scores() -> None:
         return compute
 
     assert metric_scores(my_metric()) == "unreduced"
+
+
+def test_aggregate_preserves_inner_score_mode() -> None:
+    assert metric_scores(aggregate("verdict", frequency())) == "unreduced"
+    assert metric_scores(aggregate("verdict", accuracy())) == "auto"
+    assert metric_scores(aggregate("verdict", agg=frequency())) == "unreduced"
+    nested = aggregate("outer", agg=aggregate("inner", frequency()))
+    assert metric_scores(nested) == "unreduced"
+    restored = metric_create("aggregate", key="verdict", agg=frequency())
+    assert metric_scores(restored) == "unreduced"
+    assert registry_info(aggregate).metadata == {}
+    assert (
+        metric_scores(metric_create("aggregate", key="verdict", agg=accuracy()))
+        == "auto"
+    )
+
+
+def test_aggregate_accepts_unregistered_metric() -> None:
+    def count(scores: list[SampleScore]) -> int:
+        return len(scores)
+
+    wrapped = aggregate("verdict", count)
+    assert metric_scores(wrapped) == "auto"
+    assert cast(MetricProtocol, wrapped)([ss({"verdict": "C"})]) == 1
+
+
+@scorer(metrics=[aggregate("verdict", frequency(categories=["C", "I"]))])
+def _aggregate_frequency_scorer() -> Scorer:
+    async def score(state: TaskState, target: Target) -> Score:
+        return Score(value={"verdict": "C" if state.epoch <= 2 else "I"})
+
+    return score
+
+
+def test_aggregate_frequency_preserves_epoch_observations(tmp_path: Path) -> None:
+    log = eval(
+        Task(
+            dataset=[Sample(input="q")],
+            solver=[],
+            scorer=_aggregate_frequency_scorer(),
+            epochs=Epochs(3, "mode"),
+        ),
+        model="mockllm/model",
+        log_dir=str(tmp_path),
+        display="none",
+    )[0]
+    assert log.status == "success"
+    assert log.results is not None
+    [result] = log.results.scores
+    assert result.metrics["C"].value == pytest.approx(2 / 3)
+    assert result.metrics["I"].value == pytest.approx(1 / 3)
+    assert result.scored_samples == 3
+    path = tmp_path / "roundtrip.eval"
+    write_eval_log(log, str(path))
+    restored = read_eval_log(str(path))
+    recompute_metrics(restored)
+    assert restored.results is not None
+    assert restored.results.scores == log.results.scores
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +361,10 @@ def test_no_reducer_preserves_auto_metric_unreduced_behavior() -> None:
     assert score.scored_samples == 2
 
 
-def test_no_reducer_rejects_explicit_reduced_metric_for_repeated_samples() -> None:
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_no_reducer_rejects_explicit_reduced_metric_for_repeated_samples(
+    wrapped: bool,
+) -> None:
     from inspect_ai._eval.task.results import (
         ScorerInfo,
         compute_eval_scores_for_views,
@@ -313,15 +377,16 @@ def test_no_reducer_rejects_explicit_reduced_metric_for_repeated_samples() -> No
 
         return compute
 
+    count = aggregate("value", reduced_count()) if wrapped else reduced_count()
     with pytest.raises(ValueError, match="epoch reduction is disabled"):
         compute_eval_scores_for_views(
             [
                 SampleScore(sample_id=1, score=Score(value="C")),
                 SampleScore(sample_id=1, score=Score(value="I")),
             ],
-            [reduced_count()],
+            [count],
             "x",
-            ScorerInfo(name="x", metrics=[reduced_count()]),
+            ScorerInfo(name="x", metrics=[count]),
             [],
         )
 

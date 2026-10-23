@@ -1,5 +1,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import wraps
+from inspect import signature
 from logging import getLogger
 from typing import (
     Any,
@@ -489,6 +491,29 @@ def metric_scores(metric: Metric) -> MetricScores:
     """Read the declared ``scores`` mode for a metric instance."""
     mode = registry_info(metric).metadata.get(METRIC_SCORES, "auto")
     return cast(MetricScores, mode)
+
+
+def _metric_wraps(
+    parameter: str,
+) -> Callable[[Callable[P, Metric]], Callable[P, Metric]]:
+    """Register a composing metric with its inner metric's score-view contract."""
+
+    def decorate(factory: Callable[P, Metric]) -> Callable[P, Metric]:
+        create_metric = metric(factory)
+        factory_signature = signature(factory)
+
+        @wraps(factory)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> Metric:
+            instance = create_metric(*args, **kwargs)
+            inner = factory_signature.bind(*args, **kwargs).arguments[parameter]
+            scores = metric_scores(inner) if is_registry_object(inner) else "auto"
+            if scores != "auto":
+                registry_info(instance).metadata[METRIC_SCORES] = scores
+            return instance
+
+        return metric_register(wrapper, name=registry_info(create_metric).name)
+
+    return decorate
 
 
 @overload

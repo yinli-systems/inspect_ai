@@ -8,13 +8,13 @@ from .._metric import (
     SampleScore,
     Value,
     ValueToFloat,
-    metric,
+    _metric_wraps,
 )
 
 logger = getLogger(__name__)
 
 
-@metric
+@_metric_wraps("agg")
 def aggregate(
     key: str,
     agg: Metric,
@@ -28,6 +28,9 @@ def aggregate(
     `aggregate` selects one field by `key` and feeds the resulting scalar
     `SampleScore`s into `agg`, so any standard metric (`mean`, `stderr`,
     `std`, `accuracy`, ...) can be applied per key.
+
+    The inner metric's epoch-reduction contract is preserved. For example,
+    `frequency()` receives every epoch's value even when a reducer is configured.
 
     A missing key (either `key not in value` or `value[key] is None`) is
     routed through `on_missing`. This matches the convention used by
