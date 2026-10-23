@@ -100,7 +100,14 @@ from inspect_ai.util._limit import (
 )
 
 from ._agent_message import validate_agent_message
-from ._cache import CacheEntry, CachePolicy, cache_fetch, cache_store, epoch
+from ._cache import (
+    CacheEntry,
+    CachePolicy,
+    cache_fetch,
+    cache_model_args_key,
+    cache_store,
+    epoch,
+)
 from ._call_tools import (
     copy_tools_info,
     execute_tools,
@@ -875,6 +882,7 @@ class Model:
         self.api = api
         self.config = config
         self.model_args = model_args if model_args is not None else {}
+        self._cache_instance_key = uuid()
         self._role: str | None = None
         self._explicit_base_url: str | None = None
 
@@ -1444,6 +1452,16 @@ class Model:
             cache_policy: bool | CachePolicy | None = config.cache
         else:
             cache_policy = cache
+        model_args_key = cache_model_args_key(self.model_args) if cache_policy else None
+        if cache_policy and model_args_key is None:
+            warn_once(
+                logger,
+                "Model output caching is scoped to this model instance: constructor "
+                "arguments contain values without a reliable persistent identity.",
+            )
+            model_args_key = cache_model_args_key(
+                self.model_args, instance_key=self._cache_instance_key
+            )
         hooks_enabled = any(hook.enabled() for hook in get_all_hooks())
         cache_mode: Literal["write"] | None = "write" if cache_policy else None
 
@@ -1523,6 +1541,7 @@ class Model:
                     policy=policy,
                     tool_choice=tool_choice,
                     tools=event_tools,
+                    model_args_key=model_args_key,
                 )
                 existing = cache_fetch(cache_entry)
                 if isinstance(existing, ModelOutput):
