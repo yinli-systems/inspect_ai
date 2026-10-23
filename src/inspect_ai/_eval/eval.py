@@ -1761,6 +1761,17 @@ async def eval_retry_async(
             except Exception as ex:
                 log.warning(f"Recovery failed for {eval_log.location}: {ex}")
 
+    # resolve log_model_api from env var if not explicitly set
+    if log_model_api is None:
+        log_model_api_env = os.environ.get("INSPECT_EVAL_LOG_MODEL_API")
+        if log_model_api_env is not None:
+            log_model_api = log_model_api_env.lower() in ("true", "1", "yes")
+    # resolve log_refusals from env var if not explicitly set
+    if log_refusals is None:
+        log_refusals_env = os.environ.get("INSPECT_EVAL_LOG_REFUSALS")
+        if log_refusals_env is not None:
+            log_refusals = log_refusals_env.lower() in ("true", "1", "yes")
+
     # eval them in turn
     eval_logs: list[EvalLog] = []
     for i, eval_log in enumerate(retry_eval_logs):
@@ -1824,13 +1835,14 @@ async def eval_retry_async(
         metadata = eval_log.eval.metadata
         limit = eval_log.eval.config.limit
         # try to match log format of retried log
-        if log_format is None and eval_log.location:
+        resolved_log_format = log_format
+        if resolved_log_format is None and eval_log.location:
             ext = os.path.splitext(eval_log.location)[1]
             match ext:
                 case ".eval":
-                    log_format = "eval"
+                    resolved_log_format = "eval"
                 case ".json":
-                    log_format = "json"
+                    resolved_log_format = "json"
         sample_id = _requalify_sample_ids(
             eval_log.eval.task, eval_log.eval.config.sample_id
         )
@@ -1857,80 +1869,72 @@ async def eval_retry_async(
         turn_limit = eval_log.eval.config.turn_limit
         time_limit = eval_log.eval.config.time_limit
         working_limit = eval_log.eval.config.working_limit
-        max_samples = max_samples or eval_log.eval.config.max_samples
-        max_tasks = max_tasks or eval_log.eval.config.max_tasks
-        max_subprocesses = max_subprocesses or eval_log.eval.config.max_subprocesses
-        max_sandboxes = max_sandboxes or eval_log.eval.config.max_sandboxes
-        sandbox_cleanup = (
+        resolved_max_samples = max_samples or eval_log.eval.config.max_samples
+        resolved_max_tasks = max_tasks or eval_log.eval.config.max_tasks
+        resolved_max_subprocesses = (
+            max_subprocesses or eval_log.eval.config.max_subprocesses
+        )
+        resolved_max_sandboxes = max_sandboxes or eval_log.eval.config.max_sandboxes
+        resolved_sandbox_cleanup = (
             sandbox_cleanup
             if sandbox_cleanup is not None
             else eval_log.eval.config.sandbox_cleanup
         )
-        sandbox_prebuilt = (
+        resolved_sandbox_prebuilt = (
             sandbox_prebuilt
             if sandbox_prebuilt is not None
             else eval_log.eval.config.sandbox_prebuilt
         )
-        fail_on_error = (
+        resolved_fail_on_error = (
             fail_on_error
             if fail_on_error is not None
             else eval_log.eval.config.fail_on_error
         )
-        continue_on_fail = (
+        resolved_continue_on_fail = (
             continue_on_fail
             if continue_on_fail is not None
             else eval_log.eval.config.continue_on_fail
         )
-        retry_on_error = (
+        resolved_retry_on_error = (
             retry_on_error
             if retry_on_error is not None
             else eval_log.eval.config.retry_on_error
         )
-        score_on_error = (
+        resolved_score_on_error = (
             score_on_error
             if score_on_error is not None
             else eval_log.eval.config.score_on_error
         )
-        log_samples = (
+        resolved_log_samples = (
             log_samples if log_samples is not None else eval_log.eval.config.log_samples
         )
-        log_realtime = (
+        resolved_log_realtime = (
             log_realtime
             if log_realtime is not None
             else eval_log.eval.config.log_realtime
         )
-        log_images = (
+        resolved_log_images = (
             log_images if log_images is not None else eval_log.eval.config.log_images
         )
-        # resolve log_model_api from env var if not explicitly set
-        if log_model_api is None:
-            log_model_api_env = os.environ.get("INSPECT_EVAL_LOG_MODEL_API")
-            if log_model_api_env is not None:
-                log_model_api = log_model_api_env.lower() in ("true", "1", "yes")
-        log_model_api = (
+        resolved_log_model_api = (
             log_model_api
             if log_model_api is not None
             else eval_log.eval.config.log_model_api
         )
-        # resolve log_refusals from env var if not explicitly set
-        if log_refusals is None:
-            log_refusals_env = os.environ.get("INSPECT_EVAL_LOG_REFUSALS")
-            if log_refusals_env is not None:
-                log_refusals = log_refusals_env.lower() in ("true", "1", "yes")
-        log_buffer = (
+        resolved_log_buffer = (
             log_buffer if log_buffer is not None else eval_log.eval.config.log_buffer
         )
-        log_shared = (
+        resolved_log_shared = (
             log_shared if log_shared is not None else eval_log.eval.config.log_shared
         )
-        score_display = (
+        resolved_score_display = (
             score_display
             if score_display is not None
             else eval_log.eval.config.score_display
         )
         # ACP server: explicit retry-time value wins; otherwise replay
         # whatever transport the original eval used.
-        acp_server = (
+        resolved_acp_server = (
             acp_server if acp_server is not None else eval_log.eval.config.acp_server
         )
 
@@ -1980,8 +1984,8 @@ async def eval_retry_async(
                 model_roles=model_roles,
                 task_args=task_args,
                 sandbox=eval_log.eval.sandbox,
-                sandbox_cleanup=sandbox_cleanup,
-                sandbox_prebuilt=sandbox_prebuilt,
+                sandbox_cleanup=resolved_sandbox_cleanup,
+                sandbox_prebuilt=resolved_sandbox_prebuilt,
                 solver=solver,
                 scanner=scanner,
                 scan_id=retry_scan_id,
@@ -1994,36 +1998,36 @@ async def eval_retry_async(
                 log_level=log_level,
                 log_level_transcript=log_level_transcript,
                 log_dir=log_dir,
-                log_format=log_format,
+                log_format=resolved_log_format,
                 limit=limit,
                 sample_id=sample_id,
                 sample_shuffle=sample_shuffle,
                 epochs=epochs,
-                fail_on_error=fail_on_error,
-                continue_on_fail=continue_on_fail,
-                retry_on_error=retry_on_error,
-                score_on_error=score_on_error,
+                fail_on_error=resolved_fail_on_error,
+                continue_on_fail=resolved_continue_on_fail,
+                retry_on_error=resolved_retry_on_error,
+                score_on_error=resolved_score_on_error,
                 debug_errors=debug_errors,
                 message_limit=message_limit,
                 token_limit=token_limit,
                 turn_limit=turn_limit,
                 time_limit=time_limit,
                 working_limit=working_limit,
-                max_samples=max_samples,
-                max_tasks=max_tasks,
-                max_subprocesses=max_subprocesses,
-                max_sandboxes=max_sandboxes,
-                log_samples=log_samples,
-                log_realtime=log_realtime,
-                log_images=log_images,
-                log_model_api=log_model_api,
+                max_samples=resolved_max_samples,
+                max_tasks=resolved_max_tasks,
+                max_subprocesses=resolved_max_subprocesses,
+                max_sandboxes=resolved_max_sandboxes,
+                log_samples=resolved_log_samples,
+                log_realtime=resolved_log_realtime,
+                log_images=resolved_log_images,
+                log_model_api=resolved_log_model_api,
                 log_refusals=log_refusals,
-                log_buffer=log_buffer,
-                log_shared=log_shared,
+                log_buffer=resolved_log_buffer,
+                log_shared=resolved_log_shared,
                 score=score,
-                score_display=score_display,
+                score_display=resolved_score_display,
                 checkpoint=checkpoint,
-                acp_server=acp_server,
+                acp_server=resolved_acp_server,
                 ctl_server=ctl_server,
                 **dict(config),
             )

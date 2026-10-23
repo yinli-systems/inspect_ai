@@ -20,10 +20,10 @@ from inspect_ai.log import (
     retryable_eval_logs,
     write_eval_log,
 )
-from inspect_ai.model import GenerateConfig, get_model
+from inspect_ai.model import GenerateConfig, ModelOutput, get_model
 from inspect_ai.model._providers.mockllm import MockLLM
 from inspect_ai.scorer import exact
-from inspect_ai.solver import TaskState, generate, solver
+from inspect_ai.solver import Generate, Solver, TaskState, generate, solver
 from inspect_ai.util import SandboxEnvironmentSpec
 from inspect_ai.viewer import TaskSamplesView, ViewerConfig
 
@@ -174,6 +174,109 @@ def test_eval_retry_honors_zero_max_retries(
     assert retried.status == "error"
     assert retried.plan.config.max_retries == 0
     assert attempts == 1
+
+
+@solver
+def partial_error_solver() -> Solver:
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        state.output = ModelOutput.from_content(
+            "mockllm/model", "wrong" if state.sample_id == "bad" else "correct"
+        )
+        if state.sample_id == "bad":
+            raise RuntimeError("Failure after producing an incorrect answer")
+        return state
+
+    return solve
+
+
+@task
+def retry_scoring_policy_task() -> Task:
+    return Task(
+        dataset=[
+            Sample(id=id, input="question", target="correct") for id in ("bad", "good")
+        ],
+        solver=partial_error_solver(),
+        scorer=exact(),
+    )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_eval_retry_batch_preserves_scoring_policy(
+    tmp_path: Path, reverse: bool, override: bool | None
+) -> None:
+    originals = [
+        eval(
+            retry_scoring_policy_task(),
+            model="mockllm/model",
+            log_dir=str(tmp_path),
+            fail_on_error=True,
+            continue_on_fail=True,
+            score_on_error=score_on_error,
+        )[0]
+        for score_on_error in (False, True)
+    ]
+    assert all(log.status == "error" for log in originals)
+    if reverse:
+        originals.reverse()
+
+    retried = eval_retry(originals, log_dir=str(tmp_path), score_on_error=override)
+    for original, log in zip(originals, retried):
+        expected = (
+            override if override is not None else original.eval.config.score_on_error
+        )
+        assert log.status == "error"
+        assert log.eval.config.score_on_error == expected
+        assert log.results is not None
+        result = log.results.scores[0]
+        assert result.scored_samples == (2 if expected else 1)
+        assert result.metrics["mean"].value == (0.5 if expected else 1.0)
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_eval_retry_batch_preserves_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: bool
+) -> None:
+    monkeypatch.delenv("INSPECT_EVAL_LOG_MODEL_API", raising=False)
+    originals = [
+        eval(
+            hello_world(),
+            model="mockllm/model",
+            log_dir=str(tmp_path),
+            log_format="eval" if index == 0 else "json",
+            max_samples=index + 1,
+            retry_on_error=index,
+            fail_on_error=False if index == 0 else True,
+            log_model_api=index == 0,
+        )[0]
+        for index in range(2)
+    ]
+    retried = eval_retry(
+        originals,
+        log_dir=str(tmp_path),
+        log_format="eval" if override else None,
+        max_samples=3 if override else None,
+        retry_on_error=0 if override else None,
+        fail_on_error=False if override else None,
+        log_model_api=False if override else None,
+    )
+    for original, log in zip(originals, retried):
+        assert log.status == "success"
+        assert log.eval.config.max_samples == (
+            3 if override else original.eval.config.max_samples
+        )
+        assert log.eval.config.retry_on_error == (
+            0 if override else original.eval.config.retry_on_error
+        )
+        assert log.eval.config.fail_on_error == (
+            False if override else original.eval.config.fail_on_error
+        )
+        assert log.eval.config.log_model_api == (
+            False if override else original.eval.config.log_model_api
+        )
+        assert Path(log.location).suffix == (
+            ".eval" if override else Path(original.location).suffix
+        )
 
 
 @solver
